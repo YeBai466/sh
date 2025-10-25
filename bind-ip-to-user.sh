@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # =========================================================
-# bind-ip-manager-v2.sh  —  多IP绑定管理器 (Debian 12 + Vultr)
-# 作者：ChatGPT 2025-10
+# bind-ip-manager-v3.sh — 多IP绑定管理器 (Debian 12 + Vultr)
+# 修复版：2025-10
 # =========================================================
 set -euo pipefail
 
-# ----------- 工具函数 -----------
+# ---------- 工具 ----------
 echoinfo(){ echo -e "\e[34m[INFO]\e[0m $*"; }
 echowarn(){ echo -e "\e[33m[WARN]\e[0m $*"; }
 echoerr(){ echo -e "\e[31m[ERROR]\e[0m $*" >&2; }
@@ -13,15 +13,28 @@ require_root(){ [ "$(id -u)" -eq 0 ] || { echoerr "请用 root 运行"; exit 1; 
 main_iface(){ ip route | awk '/default/ {print $5; exit}'; }
 get_gw(){ ip route show default 0.0.0.0/0 | awk '/default/ {print $3; exit}'; }
 
-# ----------- 查看当前绑定 -----------
+# ---------- 自动修复旧版 unit 文件 ----------
+fix_old_units(){
+  echoinfo "检查旧 systemd 单元文件..."
+  for f in /etc/systemd/system/bind-u*-ip.service; do
+    [ -f "$f" ] || continue
+    if grep -q 'Environment="UID=' "$f"; then
+      echowarn "检测到旧格式：$f → 修复中..."
+      sed -i 's/Environment="UID=.*"//g' "$f"
+    fi
+  done
+  systemctl daemon-reload
+}
+
+# ---------- 查看 ----------
 show_bindings(){
   echo
   echoinfo "当前绑定列表："
   found=0
   for svc in /etc/systemd/system/bind-u*-ip.service; do
     [ -f "$svc" ] || continue
-    uid=$(grep -oP 'UID=\K[0-9]+' "$svc" || true)
-    ip=$(grep -oP 'src\s+\K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$svc" || true)
+    uid=$(grep -oP 'uid-owner\s+\K[0-9]+' "$svc" || true)
+    ip=$(grep -oP 'SNAT --to-source\s+\K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$svc" || grep -oP 'src\s+\K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$svc" || true)
     user=$(getent passwd "$uid" | cut -d: -f1 || echo "未知")
     echo "  - 用户: $user (UID=$uid)  IP=$ip"
     found=1
@@ -29,7 +42,7 @@ show_bindings(){
   [ $found -eq 0 ] && echowarn "暂无绑定记录。"
 }
 
-# ----------- 删除绑定 -----------
+# ---------- 删除 ----------
 delete_binding(){
   show_bindings
   echo
@@ -49,7 +62,7 @@ delete_binding(){
   echoinfo "✅ 已删除 $deluser 的绑定。"
 }
 
-# ----------- 添加绑定 -----------
+# ---------- 添加 ----------
 add_binding(){
   IFACE=$(main_iface)
   GW=$(get_gw)
@@ -67,11 +80,10 @@ add_binding(){
   TABLE_NAME="u${UIDNUM}_tbl"; TABLE_ID=$((100+UIDNUM%900)); MARK=$((UIDNUM+1000))
 
   grep -q "$TABLE_NAME" /etc/iproute2/rt_tables || echo "$TABLE_ID $TABLE_NAME" >> /etc/iproute2/rt_tables
-  ip route flush table "$TABLE_NAME" || true
+  ip route flush table "$TABLE_NAME" 2>/dev/null || true
   ip route add default via "$GW" dev "$IFACE" src "$SEL_IP" table "$TABLE_NAME"
   ip rule del fwmark "$MARK" table "$TABLE_NAME" 2>/dev/null || true
   ip rule add fwmark "$MARK" table "$TABLE_NAME" pref 500
-
   iptables -t mangle -A OUTPUT -m owner --uid-owner "$UIDNUM" -j MARK --set-xmark "$MARK"/0xffffffff
 
   echoinfo "检测出口..."
@@ -81,7 +93,7 @@ add_binding(){
     iptables -t nat -A POSTROUTING -m mark --mark "$MARK" -j SNAT --to-source "$SEL_IP"
   fi
 
-  echoinfo "验证..."
+  echoinfo "验证出口..."
   out=$(sudo -u "$U" curl -4 -s --max-time 4 ifconfig.me || echo "N/A")
   [[ "$out" == "$SEL_IP" ]] && echoinfo "✅ 成功绑定 $U 到 $SEL_IP" || echowarn "❌ 仍未生效：$out"
 
@@ -95,16 +107,15 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-Environment="UID=$UIDNUM"
 ExecStart=/bin/bash -c '
 ip route flush table $TABLE_NAME 2>/dev/null || true
 ip route add default via $GW dev $IFACE src $SEL_IP table $TABLE_NAME
 ip rule add fwmark $MARK table $TABLE_NAME pref 500 2>/dev/null || true
-iptables -t mangle -A OUTPUT -m owner --uid-owner $UID -j MARK --set-xmark $MARK/0xffffffff
+iptables -t mangle -A OUTPUT -m owner --uid-owner $UIDNUM -j MARK --set-xmark $MARK/0xffffffff
 iptables -t nat -A POSTROUTING -m mark --mark $MARK -j SNAT --to-source $SEL_IP || true
 '
 ExecStop=/bin/bash -c '
-iptables -t mangle -D OUTPUT -m owner --uid-owner $UID -j MARK --set-xmark $MARK/0xffffffff 2>/dev/null || true
+iptables -t mangle -D OUTPUT -m owner --uid-owner $UIDNUM -j MARK --set-xmark $MARK/0xffffffff 2>/dev/null || true
 iptables -t nat -D POSTROUTING -m mark --mark $MARK -j SNAT --to-source $SEL_IP 2>/dev/null || true
 ip rule del fwmark $MARK table $TABLE_NAME 2>/dev/null || true
 ip route flush table $TABLE_NAME 2>/dev/null || true
@@ -118,7 +129,7 @@ EOF
   systemctl enable --now "$(basename "$SRV")"
 }
 
-# ----------- 菜单 -----------
+# ---------- 菜单 ----------
 menu(){
   clear
   echo "==============================="
@@ -141,6 +152,7 @@ menu(){
   menu
 }
 
-# ----------- 主流程 -----------
+# ---------- 主程序 ----------
 require_root
+fix_old_units
 menu
