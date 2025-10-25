@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
+# =========================================================
+# bind-ip-manager-v5.sh — Debian 12 多IP绑定管理工具 (Vultr优化)
+# 支持编号删除 / IPv4-only / SNAT自动修复 / 无 systemd 报错
+# =========================================================
 set -euo pipefail
 
+# ---------- 工具 ----------
 echoinfo(){ echo -e "\e[34m[INFO]\e[0m $*"; }
 echowarn(){ echo -e "\e[33m[WARN]\e[0m $*"; }
 echoerr(){ echo -e "\e[31m[ERROR]\e[0m $*" >&2; }
@@ -17,50 +22,70 @@ fix_old_units(){
   systemctl daemon-reload
 }
 
-show_bindings(){
-  echo; echoinfo "当前绑定："
-  found=0
-  for s in /etc/systemd/system/bind-u*-ip.service; do
-    [ -f "$s" ] || continue
-    ip=$(grep -oP 'SNAT --to-source \K[0-9.]+|src \K[0-9.]+' "$s" | head -n1)
-    uid=$(grep -oP 'uid-owner \K[0-9]+' "$s" | head -n1)
-    user=$(getent passwd "$uid" | cut -d: -f1 2>/dev/null || echo "未知")
-    echo "  - 用户: $user (UID=$uid) → $ip"
-    found=1
-  done
-  [ $found -eq 0 ] && echowarn "暂无绑定。"
+# ---------- 查看绑定 ----------
+list_bindings(){
+  mapfile -t BINDINGS < <(grep -l "Bind IP" /etc/systemd/system/bind-u*-ip.service 2>/dev/null || true)
 }
 
+show_bindings(){
+  list_bindings
+  echo
+  if [ "${#BINDINGS[@]}" -eq 0 ]; then
+    echowarn "暂无绑定。"
+    return 1
+  fi
+  echoinfo "当前绑定："
+  i=1
+  for s in "${BINDINGS[@]}"; do
+    ip=$(grep -oP 'SNAT --to-source \K[0-9.]+' "$s" || grep -oP 'src \K[0-9.]+' "$s" || echo "?")
+    uid=$(grep -oP 'uid-owner \K[0-9]+' "$s" | head -n1)
+    user=$(getent passwd "$uid" | cut -d: -f1 2>/dev/null || echo "未知")
+    echo " [$i] 用户: $user (UID=$uid) → $ip"
+    ((i++))
+  done
+  return 0
+}
+
+# ---------- 删除绑定（编号） ----------
 delete_binding(){
-  show_bindings
-  echo; read -rp "输入要删除的用户名: " U
-  [ -z "$U" ] && return
-  if ! id "$U" &>/dev/null; then echowarn "用户不存在"; return; fi
-  uid=$(id -u "$U")
-  echoinfo "清理 $U..."
+  show_bindings || return
+  echo
+  read -rp "输入要删除的编号: " num
+  if ! [[ "$num" =~ ^[0-9]+$ ]] || [ "$num" -lt 1 ] || [ "$num" -gt "${#BINDINGS[@]}" ]; then
+    echowarn "无效编号"; return
+  fi
+  svc="${BINDINGS[$((num-1))]}"
+  uid=$(grep -oP 'uid-owner \K[0-9]+' "$svc" | head -n1)
+  user=$(getent passwd "$uid" | cut -d: -f1 2>/dev/null || echo "未知")
+  echoinfo "正在删除：$user (UID=$uid)"
   systemctl stop "bind-u${uid}-ip.service" 2>/dev/null || true
   systemctl disable "bind-u${uid}-ip.service" 2>/dev/null || true
-  rm -f "/etc/systemd/system/bind-u${uid}-ip.service"
+  rm -f "$svc"
   iptables -t mangle -S OUTPUT | grep -- "--uid-owner $uid" | while read -r r; do iptables -t mangle ${r/-A/-D} || true; done
   iptables -t nat -S POSTROUTING | grep -- "--mark $((uid+1000))" | while read -r r; do iptables -t nat ${r/-A/-D} || true; done
   ip rule show | grep "u${uid}_tbl" | awk '{print $1}' | while read -r p; do ip rule del pref "$p" || true; done
   sed -i "/u${uid}_tbl/d" /etc/iproute2/rt_tables || true
   ip route flush table "u${uid}_tbl" 2>/dev/null || true
-  echoinfo "✅ 已删除 $U 的绑定。"
+  echoinfo "✅ 已删除绑定：$user"
 }
 
+# ---------- 添加绑定 ----------
 add_binding(){
   IFACE=$(main_iface)
   GW=$(get_gw)
-  echoinfo "接口：$IFACE 网关：$GW"
+  echoinfo "检测到主接口：$IFACE"
+  echoinfo "检测到默认网关：$GW"
+
   mapfile -t IPS < <(ip -4 addr show dev "$IFACE" | awk '/inet /{print $2}')
-  echo; i=1; for ip in "${IPS[@]}"; do echo " [$i] $ip"; ((i++)); done
+  echo; echoinfo "可选 IP："
+  i=1; for ip in "${IPS[@]}"; do echo " [$i] $ip"; ((i++)); done
   read -rp "选择编号: " c
   SEL_IP="${IPS[$((c-1))]%%/*}"
-  read -rp "用户名: " U
+  read -rp "输入用户名: " U
   id "$U" &>/dev/null || { useradd -m -s /bin/bash "$U"; echoinfo "创建用户 $U"; }
   UIDNUM=$(id -u "$U"); TABLE="u${UIDNUM}_tbl"; MARK=$((UIDNUM+1000))
   grep -q "$TABLE" /etc/iproute2/rt_tables || echo "$((100+UIDNUM%900)) $TABLE" >> /etc/iproute2/rt_tables
+
   ip route flush table "$TABLE" 2>/dev/null || true
   ip route add default via "$GW" dev "$IFACE" src "$SEL_IP" table "$TABLE"
   ip rule del fwmark "$MARK" table "$TABLE" 2>/dev/null || true
@@ -69,11 +94,11 @@ add_binding(){
 
   out=$(sudo -u "$U" curl -4 -s --max-time 4 ifconfig.me || echo "")
   if [[ "$out" != "$SEL_IP" ]]; then
-    echowarn "SNAT 启用..."
+    echowarn "启用 SNAT..."
     iptables -t nat -A POSTROUTING -m mark --mark "$MARK" -j SNAT --to-source "$SEL_IP"
   fi
   out=$(sudo -u "$U" curl -4 -s --max-time 4 ifconfig.me || echo "")
-  [[ "$out" == "$SEL_IP" ]] && echoinfo "✅ 成功绑定 $U 到 $SEL_IP" || echowarn "❌ 出口仍是 $out"
+  [[ "$out" == "$SEL_IP" ]] && echoinfo "✅ 成功绑定 $U 到 $SEL_IP" || echowarn "❌ 出口仍为 $out"
 
   SRV="/etc/systemd/system/bind-u${UIDNUM}-ip.service"
   cat >"$SRV"<<EOF
@@ -85,19 +110,8 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/bash -c '
-ip route flush table $TABLE 2>/dev/null || true
-ip route add default via $GW dev $IFACE src $SEL_IP table $TABLE
-ip rule add fwmark $MARK table $TABLE pref 500 2>/dev/null || true
-iptables -t mangle -A OUTPUT -m owner --uid-owner $UIDNUM -j MARK --set-xmark $MARK/0xffffffff
-iptables -t nat -A POSTROUTING -m mark --mark $MARK -j SNAT --to-source $SEL_IP || true
-'
-ExecStop=/bin/bash -c '
-iptables -t mangle -D OUTPUT -m owner --uid-owner $UIDNUM -j MARK --set-xmark $MARK/0xffffffff 2>/dev/null || true
-iptables -t nat -D POSTROUTING -m mark --mark $MARK -j SNAT --to-source $SEL_IP 2>/dev/null || true
-ip rule del fwmark $MARK table $TABLE 2>/dev/null || true
-ip route flush table $TABLE 2>/dev/null || true
-'
+ExecStart=/usr/bin/bash -c '/usr/sbin/ip route flush table $TABLE 2>/dev/null || true; /usr/sbin/ip route add default via $GW dev $IFACE src $SEL_IP table $TABLE; /usr/sbin/ip rule add fwmark $MARK table $TABLE pref 500 2>/dev/null || true; /usr/sbin/iptables -t mangle -A OUTPUT -m owner --uid-owner $UIDNUM -j MARK --set-xmark $MARK/0xffffffff; /usr/sbin/iptables -t nat -A POSTROUTING -m mark --mark $MARK -j SNAT --to-source $SEL_IP || true'
+ExecStop=/usr/bin/bash -c '/usr/sbin/iptables -t mangle -D OUTPUT -m owner --uid-owner $UIDNUM -j MARK --set-xmark $MARK/0xffffffff 2>/dev/null || true; /usr/sbin/iptables -t nat -D POSTROUTING -m mark --mark $MARK -j SNAT --to-source $SEL_IP 2>/dev/null || true; /usr/sbin/ip rule del fwmark $MARK table $TABLE 2>/dev/null || true; /usr/sbin/ip route flush table $TABLE 2>/dev/null || true'
 
 [Install]
 WantedBy=multi-user.target
@@ -107,27 +121,30 @@ EOF
   systemctl enable --now "bind-u${UIDNUM}-ip.service"
 }
 
+# ---------- 菜单 ----------
 menu(){
   clear
   echo "==============================="
   echo "  多IP绑定管理工具 (Debian12)"
   echo "==============================="
-  echo "  [1] 查看绑定"
-  echo "  [2] 删除绑定"
-  echo "  [3] 添加绑定"
+  echo "  [1] 查看当前绑定"
+  echo "  [2] 删除绑定 (编号选择)"
+  echo "  [3] 添加新绑定"
   echo "  [4] 退出"
   echo "-------------------------------"
-  read -rp "选择: " opt
+  read -rp "请选择操作: " opt
   case "$opt" in
     1) show_bindings ;;
     2) delete_binding ;;
     3) add_binding ;;
-    4) echoinfo "退出"; exit 0 ;;
-    *) echowarn "无效" ;;
+    4) echoinfo "已退出"; exit 0 ;;
+    *) echowarn "无效输入" ;;
   esac
-  echo; read -rp "按回车返回..." _; menu
+  echo; read -rp "按回车返回菜单..." _
+  menu
 }
 
+# ---------- 主流程 ----------
 require_root
 fix_old_units
 menu
